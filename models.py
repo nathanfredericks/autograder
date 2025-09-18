@@ -17,8 +17,9 @@ class ScoreCriteriaResponse(BaseModel):
     feedback: str | None = None
 
 
-class OverallFeedbackResponse(BaseModel):
-    feedback: str
+class BatchedScoreResponse(BaseModel):
+    criteria_scores: List[ScoreCriteriaResponse]
+    overall_feedback: str
 
 
 class CriteriaScore(BaseModel):

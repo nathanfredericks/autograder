@@ -1,73 +1,93 @@
 import csv
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
 import typer
-from celery import group
-from rich.progress import (BarColumn, MofNCompleteColumn, Progress,
-                           TaskProgressColumn, TextColumn, TimeElapsedColumn,
-                           TimeRemainingColumn)
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from models import CriteriaScore, Status, Submission, SubmissionScore
-from rubric import load_rubric, print_rubric
+from rubric import Rubric, load_rubric, print_rubric
 from submission import get_submissions
-from tasks import generate_overall_feedback, prepare_submission, score_criteria
-from utils import (configure_rich_progress_logging, extract_name,
-                   format_decimal, print_error)
+from tasks import prepare_submission, score_submission_batched
+from utils import (
+    configure_rich_progress_logging,
+    extract_name,
+    format_decimal,
+    print_error,
+)
+
+CSV_FIELDNAMES = ["Name", "Criteria", "Level", "Score", "Feedback"]
 
 
 def initialize_csv(output_path: Path = Path("scores.csv")) -> None:
-    fieldnames = ["Name", "Criteria", "Level", "Score", "Feedback"]
-
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer = csv.DictWriter(csvfile, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
 
 
 def append_submission_to_csv(
-    submission: Submission, output_path: Path = Path("scores.csv")
+    submission: Submission,
+    output_path: Path = Path("scores.csv"),
+    csv_lock: threading.Lock | None = None,
 ) -> None:
-    fieldnames = ["Name", "Criteria", "Level", "Score", "Feedback"]
+    if csv_lock:
+        csv_lock.acquire()
 
-    with open(output_path, "a", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    try:
+        with open(output_path, "a", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=CSV_FIELDNAMES)
 
-        if submission.score is None:
-            status_info = "Failed" if submission.status == Status.FAILED else "No Score"
-            writer.writerow(
-                {
-                    "Name": submission.name,
-                    "Criteria": "",
-                    "Level": "",
-                    "Score": "",
-                    "Feedback": status_info,
-                }
-            )
-            return
+            if submission.score is None:
+                status_info = (
+                    "Failed" if submission.status == Status.FAILED else "No Score"
+                )
+                writer.writerow(
+                    {
+                        "Name": submission.name,
+                        "Criteria": "",
+                        "Level": "",
+                        "Score": "",
+                        "Feedback": status_info,
+                    }
+                )
+                return
 
-        for criteria_score in submission.score.criteria_scores:
-            writer.writerow(
-                {
-                    "Name": submission.name,
-                    "Criteria": criteria_score.criteria_name,
-                    "Level": criteria_score.level_definition,
-                    "Score": format_decimal(criteria_score.score),
-                    "Feedback": criteria_score.feedback,
-                }
-            )
+            for criteria_score in submission.score.criteria_scores:
+                writer.writerow(
+                    {
+                        "Name": submission.name,
+                        "Criteria": criteria_score.criteria_name,
+                        "Level": criteria_score.level_definition,
+                        "Score": format_decimal(criteria_score.score),
+                        "Feedback": criteria_score.feedback,
+                    }
+                )
 
-        if submission.score.overall_feedback:
-            writer.writerow(
-                {
-                    "Name": submission.name,
-                    "Criteria": "",
-                    "Level": "",
-                    "Score": "",
-                    "Feedback": submission.score.overall_feedback,
-                }
-            )
+            if submission.score.overall_feedback:
+                writer.writerow(
+                    {
+                        "Name": submission.name,
+                        "Criteria": "",
+                        "Level": "",
+                        "Score": "",
+                        "Feedback": submission.score.overall_feedback,
+                    }
+                )
+    finally:
+        if csv_lock:
+            csv_lock.release()
 
 
 def validate_paths(
@@ -102,6 +122,92 @@ def validate_paths(
             f"Submissions folder path '{submissions_folder}' is not a directory."
         )
         raise typer.Exit(1)
+
+
+def create_failed_submission(
+    submission_folder: str, submission_name: str
+) -> Submission:
+    name = extract_name(submission_name)
+    return Submission(
+        name=name,
+        folder_path=submission_folder,
+        files=[],
+        status=Status.FAILED,
+        score=None,
+    )
+
+
+def process_single_submission(
+    submission_folder: str,
+    rubric: Rubric,
+    assignment_description_content: str,
+    csv_output_path: Path,
+    logger: logging.Logger,
+    csv_lock: threading.Lock,
+) -> Submission:
+    submission_name = Path(submission_folder).name
+    submission = None
+    submission_dict = None
+    criteria_scores = None
+
+    try:
+        try:
+            prepare_result = prepare_submission.delay(submission_folder)
+            submission_dict = prepare_result.get()
+            submission = Submission.model_validate(submission_dict)
+        except Exception as e:
+            logger.error(e)
+            raise
+
+        if submission:
+            try:
+                criteria_dicts = [criteria.model_dump() for criteria in rubric.criteria]
+                batched_scoring_task = score_submission_batched.delay(
+                    criteria_dicts,
+                    assignment_description_content,
+                    submission_dict,
+                )
+                batched_result = batched_scoring_task.get()
+
+                criteria_scores = [
+                    CriteriaScore.model_validate(score_dict)
+                    for score_dict in batched_result["criteria_scores"]
+                ]
+                overall_feedback = batched_result["overall_feedback"]
+
+            except Exception as e:
+                logger.error(e)
+                submission.status = Status.FAILED
+                return submission
+
+            if criteria_scores:
+                total_score = sum(score.score for score in criteria_scores)
+
+                submission.score = SubmissionScore(
+                    total_score=total_score,
+                    criteria_scores=criteria_scores,
+                    overall_feedback=overall_feedback,
+                )
+                submission.status = Status.SCORED
+
+                logger.info(f"{submission.name}: {format_decimal(total_score)} points")
+
+                for score in criteria_scores:
+                    logger.info(
+                        f"* {score.criteria_name}: {format_decimal(score.score)} points"
+                    )
+                    logger.info(f"  * {score.level_definition}")
+                    if score.feedback:
+                        logger.info(f"  * Feedback: {score.feedback}")
+
+                if overall_feedback:
+                    logger.info(f"* Overall Feedback: {overall_feedback}")
+
+        return submission
+
+    except Exception as e:
+        logger.error(e)
+        return create_failed_submission(submission_folder, submission_name)
 
 
 def main(
@@ -149,6 +255,7 @@ def main(
     initialize_csv(csv_output_path)
 
     all_submissions: List[Submission] = []
+    csv_lock = threading.Lock()
 
     with Progress(*progress_columns, transient=False) as progress:
         configure_rich_progress_logging(progress.console)
@@ -159,103 +266,39 @@ def main(
             total=len(submission_folders),
         )
 
-        for submission_folder in submission_folders:
-            submission_name = Path(submission_folder).name
-            submission = None
-            submission_dict = None
-            criteria_scores = None
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_folder = {
+                executor.submit(
+                    process_single_submission,
+                    submission_folder,
+                    rubric,
+                    assignment_description_content,
+                    csv_output_path,
+                    logger,
+                    csv_lock,
+                ): submission_folder
+                for submission_folder in submission_folders
+            }
 
-            try:
+            for future in as_completed(future_to_folder):
                 try:
-                    prepare_result = prepare_submission.delay(submission_folder)
-                    submission_dict = prepare_result.get()
-                    submission = Submission.model_validate(submission_dict)
+                    submission = future.result()
+                    all_submissions.append(submission)
+                    append_submission_to_csv(submission, csv_output_path, csv_lock)
+                    progress.update(task, advance=1)
+
                 except Exception as e:
-                    logger.error(e)
-                    raise
-
-                if submission:
-                    scoring_jobs = group(
-                        score_criteria.s(
-                            criteria.model_dump(),
-                            assignment_description_content,
-                            submission_dict,
-                        )
-                        for criteria in rubric.criteria
+                    submission_folder = future_to_folder[future]
+                    submission_name = Path(submission_folder).name
+                    failed_submission = create_failed_submission(
+                        submission_folder, submission_name
                     )
-
-                    result_group = scoring_jobs.apply_async()
-
-                    try:
-                        criteria_scores_dicts = result_group.get()
-                        criteria_scores = [
-                            CriteriaScore.model_validate(score_dict)
-                            for score_dict in criteria_scores_dicts
-                        ]
-                    except Exception as e:
-                        logger.error(e)
-                        submission.status = Status.FAILED
-                        all_submissions.append(submission)
-                        append_submission_to_csv(submission, csv_output_path)
-                        progress.update(task, advance=1)
-                        continue
-
-                    if criteria_scores:
-                        total_score = sum(score.score for score in criteria_scores)
-
-                        try:
-                            overall_feedback_task = generate_overall_feedback.delay(
-                                assignment_description_content,
-                                submission_dict,
-                                criteria_scores_dicts,
-                            )
-                            overall_feedback = overall_feedback_task.get()
-                        except Exception as e:
-                            logger.error(e)
-                            overall_feedback = None
-
-                        submission.score = SubmissionScore(
-                            total_score=total_score,
-                            criteria_scores=criteria_scores,
-                            overall_feedback=overall_feedback,
-                        )
-                        submission.status = Status.SCORED
-
-                        all_submissions.append(submission)
-                        append_submission_to_csv(submission, csv_output_path)
-
-                        logger.info(
-                            f"{submission.name}: {format_decimal(total_score)} points"
-                        )
-
-                        for score in criteria_scores:
-                            logger.info(
-                                f"* {score.criteria_name}: {format_decimal(score.score)} points"
-                            )
-                            logger.info(f"  * {score.level_definition}")
-                            if score.feedback:
-                                logger.info(f"  * Feedback: {score.feedback}")
-
-                        if overall_feedback:
-                            logger.info(f"* Overall Feedback: {overall_feedback}")
-
-                progress.update(task, advance=1)
-
-            except Exception as e:
-                name = extract_name(submission_name)
-                failed_submission = Submission(
-                    name=name,
-                    folder_path=submission_folder,
-                    files=[],
-                    status=Status.FAILED,
-                    score=None,
-                )
-                all_submissions.append(failed_submission)
-
-                append_submission_to_csv(failed_submission, csv_output_path)
-
-                logger.error(e)
-                progress.update(task, advance=1)
+                    all_submissions.append(failed_submission)
+                    append_submission_to_csv(
+                        failed_submission, csv_output_path, csv_lock
+                    )
+                    logger.error(f"Error processing {submission_name}: {e}")
+                    progress.update(task, advance=1)
 
 
 typer.run(main)
