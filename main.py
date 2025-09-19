@@ -7,26 +7,16 @@ from pathlib import Path
 from typing import List
 
 import typer
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from rich.progress import (BarColumn, MofNCompleteColumn, Progress,
+                           TaskProgressColumn, TextColumn, TimeElapsedColumn,
+                           TimeRemainingColumn)
 
 from models import CriteriaScore, Status, Submission, SubmissionScore
 from rubric import Rubric, load_rubric, print_rubric
 from submission import get_submissions
 from tasks import prepare_submission, score_submission_batched
-from utils import (
-    configure_rich_progress_logging,
-    extract_name,
-    format_decimal,
-    print_error,
-)
+from utils import (configure_rich_progress_logging, extract_name,
+                   format_decimal, print_error)
 
 CSV_FIELDNAMES = ["Name", "Criteria", "Level", "Score", "Feedback"]
 

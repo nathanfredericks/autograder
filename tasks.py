@@ -9,13 +9,8 @@ from openai.types.responses import ResponseInputParam
 
 load_dotenv()
 
-from models import (
-    BatchedScoreResponse,
-    CriteriaScore,
-    Status,
-    Submission,
-    SubmissionFile,
-)
+from models import (BatchedScoreResponse, CriteriaScore, Status, Submission,
+                    SubmissionFile)
 from rubric import Criteria
 from utils import extract_name
 
@@ -90,8 +85,6 @@ IMPORTANT - Use simple language in all feedback:
 - Avoid being salesy or overly enthusiastic and instead express calm confidence
 - Keep sentences short and clear
 - Avoid using em dashes
-
-WHEN YOU ARE PROVIDING OVERALL FEEDBACK, DO NOT MENTION THE FILENAME OR HEADER.
 """,
         },
         {
@@ -143,7 +136,9 @@ For each criteria, please provide:
 1. selected_level: Choose the exact definition and score from the levels above.
 2. feedback: Brief one-sentence explanation using simple language if the student did not meet the criteria. Use active voice and keep it clear and direct.
 
-Additionally, provide overall feedback on the submission in 1-2 encouraging sentences using simple language. Focus on code quality, comments, and readability. Keep sentences short and clear.
+Provide overall feedback on the submission in 1-2 encouraging sentences using simple language. Focus on code quality, comments, and readability. Keep sentences short and clear.
+If the student met all criteria, say "Great job!", "Good job!", "Great work!", "Good work!", "Slay!", "Awesome job!", "Awesome work!", "Excellent job!", "Excellent work!" at the beginning of the overall feedback.
+Do not provide feedback that assures the student that they met requirements of the assignment.
 """,
         }
     )
